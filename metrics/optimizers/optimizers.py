@@ -19,4 +19,3 @@ class Optimizer:
             optimizer = optim.AdamW(self.param_groups)
 
         return optimizer
-

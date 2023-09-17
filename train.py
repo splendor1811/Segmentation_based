@@ -1,153 +1,286 @@
-import torch
-from torchvision import datasets, transforms
-import wandb
-import argparse
-from dataset.transform import get_transform
-from models.model import Net
-from models.loss import NllLoss
-from models.optimizer import Optimizer
-from models.scheduler import Scheduler
-from configs import cfg, update_config
-import yaml
+import os.path
+import torch.utils.data
+from torch.utils.data.dataset import random_split
+from utils import *
+
+os.environ['CUDA_LAUNCH_BLOCKING'] = "0"
+gc.collect()
+torch.cuda.empty_cache()
 
 
-class Train_pipeline():
-    def __init__(self, args, cfgs, mode):
-        self.cfgs = cfgs
-        self.args = args
-        self.mode = mode
-        # setting config to log on wandb
-        if self.mode == "train":
-            config = {
-                "epochs": self.cfgs["TRAIN"]["EPOCH"],
-                "learning_rate_init": self.cfgs["TRAIN"]["OPTIMIZER"]["LR"],
-                "batch_size": self.cfgs["TRAIN"]["BATCH_SIZE"]
-            }
-            wandb.init(project=self.cfgs["PROJECT_NAME"], entity="ai-iot", config=config)
-        # setting device
-        self.gpu = self.cfgs["TRAIN"]["GPUS"]["USE_GPU"]
-        if self.gpu:
-            self.gpu_id = self.cfgs["TRAIN"]["GPUS"]["GPU_ID"]
-            self.device = torch.device("cuda:" + self.gpu_id)
+def parser_args():
+    parser = argparse.ArgumentParser(description="Train merged datasets ")
+    parser.add_argument('--config',
+                        default='/home/splendor/Torch_Poyp_Model/configs/meta_poypv2.yaml',
+                        help='config file path')
 
-    def load_data(self):
-        # load data and preprocessing
-        train_transform, test_transform = get_transform(self.cfgs)
-        train_mnist = datasets.MNIST('../data', train=True, download=True, transform=train_transform)
-        test_mnist = datasets.MNIST('../data', train=False, transform=test_transform)
-        train_loader = torch.utils.data.DataLoader(
-            dataset=train_mnist,
-            batch_size=self.cfgs["TRAIN"]["BATCH_SIZE"],
-            shuffle=True,
-            num_workers=self.cfgs["TRAIN"]["NUM_WORKERS"]
-        )
-        test_loader = torch.utils.data.DataLoader(
-            dataset=test_mnist,
-            batch_size=self.cfgs["TRAIN"]["BATCH_SIZE"],
-            shuffle=False,
-            num_workers=self.cfgs["TRAIN"]["NUM_WORKERS"]
-        )
-        return train_loader, test_loader
-
-    def make_model(self):
-        # create model
-        model = Net()
-        model = model.to(self.device)
-        return model
-
-    def make_loss(self):
-        # create loss function
-        loss = NllLoss(self.cfgs)
-        return loss
-
-    def make_optimizer(self, model):
-        # create optimizer
-        optimizer = Optimizer(self.cfgs, model).get_optim()
-        return optimizer
-
-    def make_scheduler(self, optimizer):
-        # create scheduler
-        scheduler = Scheduler(self.cfgs, optimizer).get_scheduler()
-        return scheduler
-
-    def train_step(self, model, optimizer):
-        # train per batch
-        model.train()
-        train_loader, _ = self.load_data()
-        optimizer = self.make_optimizer(model)
-        loss = self.make_loss()
-        loss_per_batch = 0
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(self.device), target.to(self.device)
-            optimizer.zero_grad()
-            output = model(data)
-            loss_batch = loss(output, target)
-            loss_batch.backward()
-            optimizer.step()
-            loss_per_batch += loss_batch.item()
-        loss_per_batch /= len(train_loader.dataset)
-        print("train loss:", loss_per_batch)
-        return loss_per_batch
-
-    def valid_step(self, model):
-        # eval per batch
-        model.eval()
-        _, test_loader = self.load_data()
-        test_acc = 0
-        with torch.no_grad():
-            for data, target in test_loader:
-                data, target = data.to(self.device), target.to(self.device)
-                output = model(data)
-                pred = output.argmax(dim=1, keepdim=True)
-                test_acc += pred.eq(target.view_as(pred)).sum().item()
-        test_acc /= len(test_loader.dataset)
-        print("test acc:", test_acc)
-        return test_acc
-
-    def epoch_step(self):
-        epoch = self.cfgs["TRAIN"]["EPOCH"]
-        model = self.make_model()
-        optimizer = self.make_optimizer(model)
-        scheduler = self.make_scheduler(optimizer)
-        for e in range(1, epoch + 1):
-            print("Epoch: ", e)
-            train_loss = self.train_step(model, optimizer)
-            test_acc = self.valid_step(model)
-            scheduler.step()
-            log_dict = {
-                "Train loss": train_loss,
-                "Test accuracy": test_acc
-            }
-            wandb.log(log_dict)
-            save_dict = {
-                'state_dicts': model.state_dict()
-            }
-        torch.save(save_dict, self.cfgs["SAVE_MODEL_DIR"])
-        art = wandb.Artifact(f'mnist-{wandb.run.id}', type="model")
-        art.add_file(self.cfgs["SAVE_MODEL_DIR"], "last_model.pkl")
-        wandb.log_artifact(art)
-
-
-def argument_parser():
-    parser = argparse.ArgumentParser(description="attribute recognition",
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
-    parser.add_argument(
-        "--cfg", help="decide which cfg to use", type=str,
-        default="./configs/mnist.yaml",
-    )
-    parser.add_argument('--mode', type=str, default='train')
     args = parser.parse_args()
+
     return args
 
 
-if __name__ == '__main__':
-    args = argument_parser()
-    # update_config(cfg, args)
-    with open(args.cfg, 'r') as stream:
-        cfg = yaml.safe_load(stream)
-    print(cfg)
-    bot = Train_pipeline(args, cfg, mode=args.mode)
-    if args.mode == "train":
-        bot.epoch_step()
+class TrainPipeline:
+    def __init__(self, args):
+        self.args = args
+        self.args['print_log'] = True
+        self.args['model_saved_name'] = os.path.join(self.args['work_dir'], 'runs')
+        # Setting device
+        self.output_device = self.args['device']
+        self.best_dice = 0
+        self.best_iou = 0
 
+    def load_data(self, phase):
+
+        data_loader = dict()
+        if phase == 'train':
+            train_ratio = 0.8
+            test_ratio = 0.2
+
+            dataset = TrainDataset(image_root=self.args['data']['train']['img_root'],
+                                         gt_root=self.args['data']['train']['gt_root'],
+                                         train_size=self.args['data']['train']['img_size'])
+
+            num_data = len(dataset)
+            train_size = int(train_ratio * num_data)
+            val_size = int(test_ratio * num_data)
+            train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+            data_loader['train'] = torch.utils.data.DataLoader(dataset=train_dataset,
+                                                               batch_size=self.args['data']['train']['batch_size'],
+                                                               shuffle=True,
+                                                               num_workers=self.args['data']['workers_per_gpu'],
+                                                               drop_last=True, worker_init_fn=init_seed)
+
+            data_loader['eval'] = torch.utils.data.DataLoader(dataset=val_dataset,
+                                                               batch_size=self.args['data']['train']['batch_size'],
+                                                               shuffle=True,
+                                                               num_workers=self.args['data']['workers_per_gpu'],
+                                                               drop_last=False, worker_init_fn=init_seed)
+
+        return data_loader
+
+    def make_model(self):
+        model = Meta_Polypv2(decode_channels=self.args['model']['decode_channels'],
+                             pretrained=self.args['model']['pretrained'],
+                             num_classes=self.args['model']['num_classes'],
+                             window_size=self.args['model']['window_size'])
+
+        model = model.cuda(self.output_device)
+
+        return model
+
+    def make_loss(self):
+        loss = MetaPolypv2_Loss()
+        return loss
+
+    def make_optimizer(self, model):
+        optimizer = Optimizer(self.args, model).get_optim()
+
+        return optimizer
+
+    def make_scheduler(self, optimizer):
+        scheduler = Scheduler(cfgs=self.args, optimizer=optimizer).get_scheduler()
+        return scheduler
+
+    def make_work_dirs_path(self):
+        if os.path.isdir(self.args['model_saved_name']):
+            print('log_dir: ', self.args['model_saved_name'], 'already exist')
+            answer = input('delete it? y/n:')
+            if answer == 'y':
+                shutil.rmtree(self.args['model_saved_name'])
+                print('Dir removed: ', self.args['model_saved_name'])
+                input('Refresh the website of tensorboard by pressing any keys')
+            else:
+                print('Dir not removed: ', self.args['model_saved_name'])
+        self.train_writer = SummaryWriter(os.path.join(self.args['model_saved_name'], 'train'), 'train')
+        self.val_writer = SummaryWriter(os.path.join(self.args['model_saved_name'], 'val'), 'val')
+
+    def print_log(self, str, print_time=True):
+        if print_time:
+            localtime = time.asctime(time.localtime(time.time()))
+            str = "[ " + localtime + ' ] ' + str
+        print(str)
+        if self.args['print_log']:
+            with open('{}/log.txt'.format(self.args['work_dir']), 'a') as f:
+                print(str, file=f)
+
+    def record_time(self):
+        self.cur_time = time.time()
+        return self.cur_time
+
+    def split_time(self):
+        split_time = time.time() - self.cur_time
+        self.record_time()
+        return split_time
+
+    def print_time(self):
+        localtime = time.asctime(time.localtime(time.time()))
+        self.print_log("Local current time :  " + localtime)
+
+    def train_step(self, model: nn.Module, optimizer: optim.Optimizer, epoch, scheduler, save_model=False):
+        model.train()
+        self.print_log('Training epoch: {}'.format(epoch + 1))
+        train_loader = self.load_data(phase='train')['train']
+
+        self.train_writer.add_scalar('epoch', epoch, self.global_step)
+        self.record_time()
+        timer = dict(dataloader=0.001, model=0.001, statistics=0.001)
+
+        loss = self.make_loss()
+        loss_per_batch = 0
+        dice_value = []
+        iou_value = []
+        for batch_idx, (batch_image, batch_mask) in enumerate(tqdm(train_loader, ncols=40)):
+            self.global_step += 1
+            with torch.no_grad():
+                batch_image = batch_image.float().cuda(self.output_device)
+                batch_mask = batch_mask.float().cuda(self.output_device)
+            timer['dataloader'] += self.split_time()
+
+            # forward path
+            output_mask = model(batch_image)
+            output_mask = list(output_mask)
+            output_mask[0] = torch.sigmoid(output_mask[0])
+            output_mask[1] = torch.sigmoid(output_mask[1])
+            loss_batch = loss(output_mask, batch_mask)
+            optimizer.zero_grad()
+            clip_gradient(optimizer=optimizer, grad_clip=0.5)
+            loss_batch.backward()
+            # torch.nn.utils.clip_grad_norm_(model.parameters(),
+            #                               max_norm=self.args['optimizer_config']['grad_clip']['max_norm'],
+            #                               norm_type=self.args['optimizer_config']['grad_clip']['norm_type'])
+            optimizer.step()
+            loss_per_batch += loss_batch.data.item()
+
+            timer['model'] += self.split_time()
+
+            self.threshold = self.args['threshold']
+            low = torch.tensor(0.).to(self.output_device)
+            high = torch.tensor(1.).to(self.output_device)
+            output_mask[0] = torch.where(output_mask[0] < self.threshold, low, high)
+
+            Dice_score = Dice_Coeff()(output_mask[0], batch_mask).float().cpu().detach().numpy()
+            IoU_score = IoU()(output_mask[0], batch_mask).float().cpu().detach().numpy()
+            dice_value.append(Dice_score)
+            iou_value.append(IoU_score)
+
+            timer['statistics'] += self.split_time()
+
+        loss_per_batch /= len(train_loader.dataset)
+        dice_value = np.mean(dice_value) * 100
+        iou_value = np.mean(iou_value) * 100
+
+        self.train_writer.add_scalar('dice_score', dice_value, self.global_step)
+        self.train_writer.add_scalar('IoU_score', iou_value, self.global_step)
+        self.train_writer.add_scalar('loss_train', loss_per_batch, self.global_step)
+
+        proportion = {
+            k: '{:02d}%'.format(int(round(v * 100 / sum(timer.values()))))
+            for k, v in timer.items()
+        }
+        self.print_log(
+            '\tMean training loss: {:.4f}.  Mean dice_score: {:.2f}%.   Mean iou_score: {:.2f}%'.format(loss_per_batch,
+                                                                                                        dice_value,
+                                                                                                        iou_value))
+        self.print_log('\tTime consumption: [Data]{dataloader}, [Network]{model}'.format(**proportion))
+
+        if save_model:
+          if dice_value > 97. :
+              state_dict = model.state_dict()
+              weights = OrderedDict([[k.split('module.')[-1], v.cpu()] for k, v in state_dict.items()])
+
+              torch.save(weights,
+                        self.args['model_saved_name'] + '-' + str(epoch + 1) + '-' + str(int(self.global_step)) + '.pt')
+
+        return loss_per_batch, dice_value, iou_value
+
+    def eval_step(self, model: nn.Module, epoch):
+        model.eval()
+        self.print_log('Eval epoch: {}'.format(epoch + 1))
+
+        eval_loader = self.load_data(phase='train')['eval']
+        dice_value = []
+        iou_value = []
+        for batch_idx, (batch_image, batch_mask) in enumerate(tqdm(eval_loader, ncols=40)):
+            with torch.no_grad():
+                batch_image = batch_image.float().cuda(self.output_device)
+                batch_mask = batch_mask.float().cuda(self.output_device)
+
+                output_mask = model(batch_image)
+                output_mask = torch.sigmoid(output_mask)
+
+                self.threshold = self.args['threshold']
+                low = torch.tensor(0.).to(self.output_device)
+                high = torch.tensor(1.).to(self.output_device)
+                output_mask = torch.where(output_mask < self.threshold, low, high)
+
+                Dice_score = Dice_Coeff()(output_mask, batch_mask).float().cpu().detach().numpy()
+                IoU_score = IoU()(output_mask, batch_mask).float().cpu().detach().numpy()
+                dice_value.append(Dice_score)
+                iou_value.append(IoU_score)
+
+        dice_value = np.mean(dice_value) * 100
+        iou_value = np.mean(iou_value) * 100
+
+        if dice_value > self.best_dice:
+            self.best_dice = dice_value
+            self.best_dice_epoch = epoch + 1
+
+        if iou_value > self.best_iou:
+            self.best_iou = iou_value
+            self.best_iou = epoch + 1
+
+        self.print_log(
+            '\tMean test dice_score: {:.2f}%.   Mean test iou_score: {:.2f}%'.format(dice_value, iou_value))
+        self.val_writer.add_scalar('dice', dice_value, self.global_step)
+        self.val_writer.add_scalar('iou', iou_value, self.global_step)
+
+        return dice_value, iou_value
+
+    def epoch_step(self):
+        self.make_work_dirs_path()
+        model = self.make_model()
+        self.args['start_epoch'] = 0
+        self.global_step = self.args['start_epoch'] * len(self.load_data(phase='train')['train']) / self.args['data'][
+            'train']['batch_size']
+
+        def count_parameters(train_model):
+            return sum(p.numel() for p in train_model.parameters() if p.requires_grad)
+
+        optimizer = self.make_optimizer(model=model)
+        scheduler = self.make_scheduler(optimizer=optimizer)
+        self.print_log(f'# Parameters: {count_parameters(model)}')
+        for epoch in range(self.args['start_epoch'], self.args['num_epochs']):
+            save_model = True
+            train_loss, dice_score, iou_score = self.train_step(model=model, optimizer=optimizer, epoch=epoch,
+                                                                scheduler=scheduler, save_model=save_model)
+            val_dice_score, val_iou_score = self.eval_step(model=model, epoch=epoch)
+
+            scheduler.step()
+
+            save_metrics = {
+                "Train/Train loss": train_loss,
+                "Train/dice_score": dice_score,
+                "Train/iou_score": iou_score
+            }
+
+            val_metric = {
+                'Eval/ dice_score' : val_dice_score,
+                'Eval/ iou_score' : val_iou_score
+            }
+            # wandb.log({**save_metrics, **val_metric})
+
+
+def main(args):
+    config = args.config
+    f = open(config, 'r')
+    default_args = yaml.safe_load(f)
+    train = TrainPipeline(default_args)
+    train.epoch_step()
+
+
+if __name__ == '__main__':
+    args = parser_args()
+    # wandb.login(relogin=True)
+    # wandb.init(project='Project_1', name='MetaPolypv2', config=args)
+    main(args)

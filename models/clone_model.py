@@ -1,6 +1,6 @@
 import torch.nn as nn
-from models.encoder_metaformer import caformer_s36_in21ft1k
-from models.decoder_metaformer import Decoder
+from models.encoder_metaformer import caformer_s18_in21ft1k
+from models.clone_decoder import Decoder
 from torchsummary import summary
 
 
@@ -12,7 +12,7 @@ class Meta_Polypv2(nn.Module):
                  num_classes=1):
         super().__init__()
 
-        self.backbone = caformer_s36_in21ft1k(pretrained=pretrained)
+        self.backbone = caformer_s18_in21ft1k(pretrained=pretrained)
         encoder_channels = (64, 128, 320, 512)
 
         self.decoder = Decoder(encoder_channels, decode_channels, dropout, window_size, num_classes)

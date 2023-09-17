@@ -1,0 +1,12 @@
+[ Sat Aug 26 17:11:52 2023 ] # Parameters: 65478036
+[ Sat Aug 26 17:11:52 2023 ] Training epoch: 1
+[ Sat Aug 26 17:19:56 2023 ] 	Mean training loss: 1.8374.  Mean dice_score: 55.64%.   Mean iou_score: 42.86%
+[ Sat Aug 26 17:19:56 2023 ] 	Time consumption: [Data]01%, [Network]99%
+[ Sat Aug 26 17:19:56 2023 ] Eval epoch: 1
+[ Sat Aug 26 17:20:29 2023 ] 	Mean test dice_score: 63.38%.   Mean test iou_score: 50.81%
+[ Sat Aug 26 17:20:29 2023 ] Training epoch: 2
+[ Sat Aug 26 17:29:41 2023 ] 	Mean training loss: 1.7505.  Mean dice_score: 65.16%.   Mean iou_score: 53.06%
+[ Sat Aug 26 17:29:41 2023 ] 	Time consumption: [Data]01%, [Network]98%
+[ Sat Aug 26 17:29:41 2023 ] Eval epoch: 2
+[ Sat Aug 26 17:30:13 2023 ] 	Mean test dice_score: 64.24%.   Mean test iou_score: 54.11%
+[ Sat Aug 26 17:30:13 2023 ] Training epoch: 3
